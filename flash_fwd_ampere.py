@@ -2208,7 +2208,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softcap_val = None
         else:
             softmax_scale_log2 = softcap * LOG2_E
+            print(f"softmax_scale_log2: {softmax_scale_log2}")
             softcap_val = cutlass.Float32(softmax_scale / softcap)
+            print(f"softcap_val: {softcap_val}")
         self.kernel(
             mQ,
             mK,
@@ -2602,7 +2604,8 @@ def run_flash_attention_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
-    softcap: Optional[float] = None,
+    #softcap: Optional[float] = None,
+    softcap : float = 0.0,
 ):
     
 
@@ -2617,7 +2620,7 @@ def run_flash_attention_fwd(
         # (batch_size, seqlen, num_head, head_dim)
         shape = (batch_size, seqlen, num_head, head_dim)
         return (
-            torch.empty(*shape, dtype=torch.int32).random_(-2, 2).to(dtype=dtype).cuda()
+            torch.empty(*shape, dtype=torch.int32).random_(-2, 2).to(dtype=dtype).cuda().requires_grad_()
         )
 
     q = create_tensor(
@@ -2682,8 +2685,8 @@ def run_flash_attention_fwd(
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
-    if softcap == 0.0:
-        softcap = None
+    #if softcap == 0.0:
+    #    softcap = None
     qhead_per_kvhead = num_head // num_head_kv
 
     out_torch_dtype = q.dtype
@@ -2719,7 +2722,7 @@ def run_flash_attention_fwd(
                 head_dim,
                 head_dim_v,
                 qhead_per_kvhead,
-                is_causal=is_causal,
+                is_causal=is_causal, # true
                 is_local=local,
                 pack_gqa=False,
                 m_block_size=m_block_size,
@@ -2772,7 +2775,9 @@ def run_flash_attention_fwd(
     #softmax_tensor = convert_from_dlpack(softmax_scale, leading_dim=softmax_scale.ndim - 1, alignment=16)
     #softmax_scale_tensor = from_dlpack(softmax_scale_2).mark_layout_dynamic()
     softmax_scale_cute = cutlass.Float32(softmax_scale) # float -> cutlass.base_dsl.typing.Float32
-    #softcap = cutlass.Float32(softcap)
+    softcap = cutlass.Float32(0.0)
+    #window_size_left = cutlass.Int32(window_size_left)
+    window_size_right = cutlass.Int32(window_size_right)
     compiled_fa2_fwd = cute.compile(
         fa2_fwd, q_tensor, k_tensor, v_tensor, o_tensor,lse_tensor,current_stream, softmax_scale_cute, softcap, window_size_left,window_size_right,
     )
@@ -2885,7 +2890,8 @@ if __name__ == "__main__":
     parser.add_argument("--m_block_size", type=int, default=128)
     parser.add_argument("--n_block_size", type=int, default=64)
     parser.add_argument("--num_threads", type=int, default=128)
-    parser.add_argument("--is_causal", action="store_true", help="Enable causal mask")
+    #parser.add_argument("--is_causal", action="store_true", help="Enable causal mask")
+    parser.add_argument("--is_causal", type=bool, default=True, help="Enable causal mask")
     parser.add_argument("--warmup_iterations", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument(

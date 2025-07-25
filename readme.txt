@@ -12,4 +12,10 @@ uv pip install nvidia-cutlass-dsl
 uv pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 
 
+
+how to debug
+export CUTE_DSL_LOG_TO_CONSOLE=10
+
+it wiil generate log txt, its name is CUTE_DSL.log  
+
 Arch of Both RTX3090  and A100 is ampere 
