@@ -60,6 +60,7 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     _compute_capability: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -128,12 +129,13 @@ def _flash_attn_fwd(
         else:
             causal, local = False, True
     compute_capability = torch.cuda.get_device_capability()[0] if _compute_capability is None else _compute_capability
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    print(f"compute_capability: {compute_capability}")
+    #assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    if compute_capability == 9:  # TODO: tune block size according to hdim
-        if not causal and not local:
-            n_block_size = 192
+    #if compute_capability == 9:  # TODO: tune block size according to hdim
+    #    if not causal and not local:
+    #        n_block_size = 192
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
@@ -143,9 +145,9 @@ def _flash_attn_fwd(
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
-        if compute_capability == 9:
-            # fa_fwd = FlashAttentionForwardSm80(
-            fa_fwd = FlashAttentionForwardSm90(
+        if compute_capability == 8:
+             fa_fwd = FlashAttentionForwardSm80(
+            #fa_fwd = FlashAttentionForwardSm90(
                 dtype,
                 head_dim,
                 head_dim_v,
@@ -155,22 +157,13 @@ def _flash_attn_fwd(
                 pack_gqa=False,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                # num_stages=1,
-                num_stages=2,
+                num_stages=1,
+                #num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
             )
-        elif compute_capability == 10:
-            fa_fwd = FlashAttentionForwardSm100(
-                head_dim,
-                head_dim_v,
-                is_causal=causal,
-                is_local=local,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
-            )
         else:
-            raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")
+            raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 8.x")
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd, q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,

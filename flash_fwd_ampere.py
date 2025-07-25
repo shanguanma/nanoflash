@@ -19,6 +19,13 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
+# for testing
+import torch
+import cutlass.cute.testing as testing
+import argparse
+import time
+import cutlass.torch as cutlass_torch
+
 
 @cute.jit
 def clz(x: Int32) -> Int32:
@@ -1757,10 +1764,10 @@ class FlashAttentionForwardBase:
         mV_type: Type[cutlass.Numeric],
         mO_type: Type[cutlass.Numeric],
         mLSE_type: Type[cutlass.Numeric] | None,
-        mCuSeqlensQ_type: Type[cutlass.Numeric] | None,
-        mCuSeqlensK_type: Type[cutlass.Numeric] | None,
-        mSeqUsedQ_type: Type[cutlass.Numeric] | None,
-        mSeqUsedK_type: Type[cutlass.Numeric] | None,
+        #mCuSeqlensQ_type: Type[cutlass.Numeric] | None,
+        #mCuSeqlensK_type: Type[cutlass.Numeric] | None,
+        #mSeqUsedQ_type: Type[cutlass.Numeric] | None,
+        #mSeqUsedK_type: Type[cutlass.Numeric] | None,
     ):
         # Get the data type and check if it is fp16 or bf16
         if const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
@@ -1769,14 +1776,14 @@ class FlashAttentionForwardBase:
             raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(mLSE_type not in [None, cutlass.Float32]):
             raise TypeError("LSE tensor must be Float32")
-        if const_expr(mCuSeqlensQ_type not in [None, cutlass.Int32]):
-            raise TypeError("cu_seqlens_q tensor must be Int32")
-        if const_expr(mCuSeqlensK_type not in [None, cutlass.Int32]):
-            raise TypeError("cu_seqlens_k tensor must be Int32")
-        if const_expr(mSeqUsedQ_type not in [None, cutlass.Int32]):
-            raise TypeError("seqused_q tensor must be Int32")
-        if const_expr(mSeqUsedK_type not in [None, cutlass.Int32]):
-            raise TypeError("seqused_k tensor must be Int32")
+        #if const_expr(mCuSeqlensQ_type not in [None, cutlass.Int32]):
+        #    raise TypeError("cu_seqlens_q tensor must be Int32")
+        #if const_expr(mCuSeqlensK_type not in [None, cutlass.Int32]):
+        #     raise TypeError("cu_seqlens_k tensor must be Int32")
+        # if const_expr(mSeqUsedQ_type not in [None, cutlass.Int32]):
+        #     raise TypeError("seqused_q tensor must be Int32")
+        # if const_expr(mSeqUsedK_type not in [None, cutlass.Int32]):
+        #     raise TypeError("seqused_k tensor must be Int32")
         assert mQ_type == self.dtype
 
     def _setup_attributes(self):
@@ -1978,7 +1985,7 @@ class FlashAttentionForwardBase:
                 tOgO = gmem_thr_copy_O.partition_D(gO)
                 tOcO = gmem_thr_copy_O.partition_S(cO)
                 t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
-                tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+                tOpO = predicate_k(tOcO, limit=mO.shape[1])
                 # copy acc O from rmem to gmem
                 for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
                     if t0OcO[0, rest_m, 0][0] < seqlen.seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
@@ -2009,7 +2016,7 @@ class FlashAttentionForwardBase:
         cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         tQcQ = gmem_thr_copy.partition_S(cQ)
         t0QcQ = gmem_thr_copy.get_slice(0).partition_S(cQ)
-        tQpQ = utils.predicate_k(tQcQ, limit=headdim)
+        tQpQ = predicate_k(tQcQ, limit=headdim)
         for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             # Instead of using tQcQ, we using t0QcQ and subtract the offset from the limit
             # (seqlen - block * kBlockM). This is because the entries of t0QcQ are known at compile time.
@@ -2352,11 +2359,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
         # use "if" on the mn dimension.
         # This is to reduce register pressure and gets 2-3% performance gain.
-        tKpK = utils.predicate_k(tKcK, limit=mK.shape[1])
+        tKpK = predicate_k(tKcK, limit=mK.shape[1])
         if const_expr(self.same_hdim_kv):
             tVpV = tKpK
         else:
-            tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
+            tVpV = predicate_k(tVcV, limit=mV.shape[1])
 
         # shape: (atom_v_m * rest_m)
         softmax = Softmax(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1])
@@ -2554,5 +2561,350 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         # if const_expr(self.num_stages > 1):
         #     load_K_next()
+torch2cute_dtype_map = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
+def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
+    return (
+        from_dlpack(x, assumed_align=alignment)
+        .mark_layout_dynamic(leading_dim=leading_dim)
+        .mark_compact_shape_dynamic(
+            mode=leading_dim, stride_order=x.dim_order(), divisibility=divisibility
+        )
+    )
+
+def maybe_contiguous(x):
+    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+# for testing
+def run_flash_attention_fwd(
+    dtype: Type[cutlass.Numeric],
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    num_head: int,
+    head_dim: int,
+    softmax_scale: Optional[float] = None,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+    num_threads: int = 128,
+    is_causal: bool = False,
+    warmup_iterations: int = 0,
+    iterations: int = 1,
+    skip_ref_check: bool = False,
+
+    num_stages: int = 1,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    softcap: Optional[float] = None,
+):
+    
+
+    # Create tensor Q/K/V/O
+    def create_tensor(
+        batch_size: int,
+        seqlen: int,
+        num_head: int,
+        head_dim: int,
+        dtype: Type[cutlass.Numeric],
+    ) -> cute.Tensor:
+        # (batch_size, seqlen, num_head, head_dim)
+        shape = (batch_size, seqlen, num_head, head_dim)
+        return (
+            torch.empty(*shape, dtype=torch.int32).random_(-2, 2).to(dtype=dtype).cuda()
+        )
+
+    q = create_tensor(
+        batch_size, seqlen_q, num_head, head_dim, cutlass_torch.dtype(dtype)
+    )
+    k = create_tensor(
+        batch_size, seqlen_k, num_head, head_dim, cutlass_torch.dtype(dtype)
+    )
+    v = create_tensor(
+        batch_size, seqlen_k, num_head, head_dim, cutlass_torch.dtype(dtype)
+    )
+    o = create_tensor(
+        batch_size, seqlen_q, num_head, head_dim, cutlass_torch.dtype(dtype)
+    )
+    # head_dim_v = v.shape[-1]
+    # # Skip unsupported testcase
+    # if not FlashAttentionForwardSm80.can_implement(
+    #     #dtype,
+    #     #head_dim,
+    #     #m_block_size,
+    #     #n_block_size,
+    #     #num_threads,
+    #     #is_causal,
+    #     dtype, head_dim, head_dim_v, m_block_size, n_block_size, num_stages, num_threads, is_causal,
+    #     Q_in_regs=False
+    # ):
+    #     raise TypeError(
+    #         f"Unsupported testcase {dtype}, {head_dim}, {m_block_size}, {n_block_size}, {num_threads}, {is_causal}"
+    #     )
+    
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q = q.shape[:2]
+        total_q = batch_size * seqlen_q
+    else:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = None
+        total_q = q.shape[0]
+    seqlen_k, num_head_kv, _ = k.shape[-3:]
+    head_dim_v = v.shape[-1]
+    if cu_seqlens_k is None:
+        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+    else:
+        assert k.shape == (seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+        assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
+    if cu_seqlens_q is not None:
+        assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
+    assert seqused_q is None or seqused_q.shape == (batch_size,), "seqused_q must have shape (batch_size,)"
+    assert seqused_k is None or seqused_k.shape == (batch_size,), "seqused_k must have shape (batch_size,)"
+    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
+    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+        if t is not None:
+            assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
+            assert t.stride(0) == 1, "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
+    assert all(t is None or t.is_cuda for t in (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)), "inputs must be on CUDA device"
+    assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
+    assert head_dim <= 256, "head_dim must be less than or equal to 256"
+    alignment = 16 // q.element_size()
+    assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
+    assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    if softcap == 0.0:
+        softcap = None
+    qhead_per_kvhead = num_head // num_head_kv
+
+    out_torch_dtype = q.dtype
+    device = q.device
+    q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+    out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+    lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
+    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad else None
+
+    dtype = torch2cute_dtype_map[q.dtype]
+    q_tensor, k_tensor, v_tensor, o_tensor = [
+        convert_from_dlpack(
+            t.detach(), leading_dim=t.ndim - 1, divisibility=128 // dtype.width
+        ) for t in (q, k, v, out)
+    ]
+    lse_tensor = convert_from_dlpack(lse, leading_dim=lse.ndim - 1, alignment=4) if lse is not None else None
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
+        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ]
+    print(f"lse_tensor: {lse_tensor}")
+    if is_causal:
+        window_size_right = 0
+    local = window_size_left is not None or window_size_right is not None
+    if window_size_left is not None or window_size_right is not None:
+        if window_size_left is None and window_size_right == 0:
+            is_causal, local = True, False
+        else:
+            is_causal, local = False, True
+    fa2_fwd = FlashAttentionForwardSm80(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=is_causal,
+                is_local=local,
+                pack_gqa=False,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                num_stages=num_stages,
+                #num_stages=2,
+                num_threads=num_threads,
+                Q_in_regs=False,
+    )
+    # assume input is 16B align.
+    # q_tensor = (
+    #     from_dlpack(q, assumed_align=16)
+    #     .mark_layout_dynamic(leading_dim=3)
+    #     .mark_compact_shape_dynamic(
+    #         mode=3, stride_order=q.dim_order(), divisibility=(128 // dtype.width)
+    #     )
+    # )
+    # k_tensor = (
+    #     from_dlpack(k, assumed_align=16)
+    #     .mark_layout_dynamic(leading_dim=3)
+    #     .mark_compact_shape_dynamic(
+    #         mode=3, stride_order=k.dim_order(), divisibility=(128 // dtype.width)
+    #     )
+    # )
+    # v_tensor = (
+    #     from_dlpack(v, assumed_align=16)
+    #     .mark_layout_dynamic(leading_dim=3)
+    #     .mark_compact_shape_dynamic(
+    #         mode=3, stride_order=v.dim_order(), divisibility=(128 // dtype.width)
+    #     )
+    # )
+    # o_tensor = (
+    #     from_dlpack(o, assumed_align=16)
+    #     .mark_layout_dynamic(leading_dim=3)
+    #     .mark_compact_shape_dynamic(
+    #         mode=3, stride_order=o.dim_order(), divisibility=(128 // dtype.width)
+    #     )
+    # )
+
+    # Get current CUDA stream from PyTorch
+    torch_stream = torch.cuda.current_stream()
+    # Get the raw stream pointer as a CUstream
+    current_stream = cuda.CUstream(torch_stream.cuda_stream)
+    # compile the fa2 forward pass
+    # fn __call__ of fa2_fwd
+    # solve the err( Duo MA): 
+    # cutlass.base_dsl.common.DSLRuntimeError: DSLRuntimeError: expects argument #8 (softmax_scale) to be one of (<class 'cutlass.base_dsl.typing.Float32'>, <class 'NoneType'>), but got <class 'float'>
+    #softmax_scale = cutlass.base_dsl.dsl.const(softmax_scale)
+    #softmax_scale_2 = torch.tensor(softmax_scale, dtype=torch.float32, device=device)
+    #softmax_tensor = convert_from_dlpack(softmax_scale, leading_dim=softmax_scale.ndim - 1, alignment=16)
+    #softmax_scale_tensor = from_dlpack(softmax_scale_2).mark_layout_dynamic()
+    softmax_scale_cute = cutlass.Float32(softmax_scale) # float -> cutlass.base_dsl.typing.Float32
+    #softcap = cutlass.Float32(softcap)
+    compiled_fa2_fwd = cute.compile(
+        fa2_fwd, q_tensor, k_tensor, v_tensor, o_tensor,lse_tensor,current_stream, softmax_scale_cute, softcap, window_size_left,window_size_right,
+    )
+    # warmup
+    for _ in range(warmup_iterations):
+        compiled_fa2_fwd(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,current_stream, softmax_scale_cute, softcap,window_size_left,window_size_right,
+            
+        )
+    # run the compiled fa2 forward pass
+    for _ in range(iterations):
+        compiled_fa2_fwd(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,current_stream, softmax_scale_cute, softcap,window_size_left,window_size_right,
+            
+        )
+    torch.cuda.synchronize()
+
+    print("Executing fa2 forward kernel...")
+
+    avg_time_us = testing.benchmark(
+        compiled_fa2_fwd,
+        kernel_arguments=testing.JitArguments(q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,current_stream, softmax_scale_cute, softcap,window_size_left,window_size_right),
+        warmup_iterations=warmup_iterations,
+        profiling_iterations=iterations,
+        use_cuda_graphs=False,
+    )
+
+    print(f"Using cutlass.cute.testing.benchmark Kernel execution time: {avg_time_us / 1e3:.4f} ms")
+
+    print("Executing fa2 forward kernel...")
+
+    avg_time_us = testing.benchmark(
+        ref_flash_attn_fwd,
+        kernel_arguments=testing.JitArguments(q, k, v, softmax_scale_cute, is_causal),
+        warmup_iterations=warmup_iterations,
+        profiling_iterations=iterations,
+        use_cuda_graphs=False,
+    )
+
+    print(f"Using cutlass.cute.testing.benchmark, Ref Kernel execution time: {avg_time_us / 1e3:.4f} ms")
 
 
+    # reference implementation
+    ref_o = ref_flash_attn_fwd(q,k,v,softmax_scale, is_causal)
+
+
+    #Verify that the data results are correct
+    if not skip_ref_check:
+        print("Verifying results...")
+        torch.testing.assert_close(o.cpu(), ref_o.cpu(), atol=1e-02, rtol=1e-04)
+        print("Results verified successfully!")
+
+    print("")
+
+    from triton.testing import do_bench
+
+
+    fn = lambda: compiled_fa2_fwd(q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor,current_stream, softmax_scale_cute, softcap,window_size_left,window_size_right)
+    time.sleep(0.5)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    #mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    print(f"Using triton.testing.do_bench,  Kernel execution time: {avg_time:.4f} ms")
+    #print(f"Mem throughput: {mem_bw:.2f} GB/s")
+
+    fn = lambda: ref_flash_attn_fwd(q, k, v, softmax_scale,is_causal)
+    for _ in range(5):
+        fn()  # warm up
+    time.sleep(0.5)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    #mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    print(f"Using triton.testing.do_bench, Ref Kernel execution time: {avg_time:.4f} ms")
+    #print(f"Ref Mem throughput: {mem_bw:.2f} GB/s")
+
+
+
+def ref_flash_attn_fwd(q,k,v,softmax_scale, is_causal):
+    # reference implementation
+    q_ref = q.permute(0, 2, 1, 3)
+    k_ref = k.permute(0, 2, 1, 3)
+    v_ref = v.permute(0, 2, 1, 3)
+    torch.backends.cuda.enable_flash_sdp(enabled=True)
+    ref_o = torch.nn.functional.scaled_dot_product_attention(
+        q_ref, k_ref, v_ref, scale=softmax_scale, is_causal=is_causal
+    ).permute(0, 2, 1, 3)
+
+    return ref_o
+
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="example of flash attention v2 with CuTe on GPU"
+    )
+    parser.add_argument("--dtype", type=cutlass.dtype, default=cutlass.BFloat16)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--seqlen_q", type=int, default=8192)
+    parser.add_argument("--seqlen_k", type=int, default=8192)
+    parser.add_argument("--num_head", type=int, default=16)
+    parser.add_argument("--head_dim", type=int, default=128)
+    parser.add_argument("--softmax_scale", type=float, default=0.5)
+    parser.add_argument("--m_block_size", type=int, default=128)
+    parser.add_argument("--n_block_size", type=int, default=64)
+    parser.add_argument("--num_threads", type=int, default=128)
+    parser.add_argument("--is_causal", action="store_true", help="Enable causal mask")
+    parser.add_argument("--warmup_iterations", type=int, default=3)
+    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument(
+        "--skip_ref_check", action="store_true", help="Skip reference check"
+    )
+
+    args = parser.parse_args()
+    run_flash_attention_fwd(
+        args.dtype,
+        args.batch_size,
+        args.seqlen_q,
+        args.seqlen_k,
+        args.num_head,
+        args.head_dim,
+        args.softmax_scale,
+        args.m_block_size,
+        args.n_block_size,
+        args.num_threads,
+        args.is_causal,
+    )
+
+    print("PASS")                                                                                     

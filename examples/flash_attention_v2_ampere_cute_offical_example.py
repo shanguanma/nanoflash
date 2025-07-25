@@ -1287,6 +1287,7 @@ def run_flash_attention_fwd(
     # Get the raw stream pointer as a CUstream
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
     # compile the fa2 forward pass
+    # fn __call__ of fa2_fwd
     compiled_fa2_fwd = cute.compile(
         fa2_fwd, q_tensor, k_tensor, v_tensor, o_tensor, softmax_scale, current_stream
     )
